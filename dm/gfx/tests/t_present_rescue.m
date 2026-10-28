@@ -102,6 +102,21 @@ static void latency(void) {   // frame latency 1 in a window, 2 in fullscreen, D
     test_fullscreen = 0; link_sync(); CHECK("DM_PRESENT_LATENCY wins in a window", link.preferredFrameLatency == 3);
     g_present_latency = 0; test_fullscreen = 0; link_sync(); g_link = nil; g_link_started = 0;
 }
+// The front end moved the game's layer to another screen (iOS: an external display, dm_present_layer_moved): the link made for the old screen goes, and the mode is dropped so link_sync starts a new one
+static void layer_moved(void) {
+    reset(); atomic_store(&g_layer_moved, 0); SilentDisplayLink *link = [SilentDisplayLink new];
+    g_link = link; g_link_started = 1; g_link_rl = CFRunLoopGetCurrent();
+    link_sync(); CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+    CHECK("a layer that did not move keeps its link", g_link == link && !link.invalidated && g_link_owns_layer && g_link_mode == 1);
+    dm_present_layer_moved(); link_sync();
+    CHECK("a moved layer's mode is dropped", g_link_mode == 0 && !atomic_load(&g_layer_moved));
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+    CHECK("a moved layer's link is invalidated and the layer released", link.invalidated && !g_link && !g_link_owns_layer);
+    g_link_started = 0; reset();
+    dm_present_layer_moved(); link_sync();
+    CHECK("a move with no link running starts none (the layer is not there yet)", !g_link_started && !g_link);
+    atomic_store(&g_layer_moved, 0);
+}
 static void metal_lifecycle(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     CHECK("Metal device available", device != nil); if (!device) return;
@@ -120,7 +135,7 @@ static void metal_lifecycle(void) {
 int main(int argc, char **argv) { @autoreleasepool {
     alarm(10); setbuf(stdout, NULL);
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "--metal"))) return 2;
-    thresholds(); backoff(); settings(); lifecycle(); latency();
+    thresholds(); backoff(); settings(); lifecycle(); latency(); layer_moved();
     if (argc == 2) metal_lifecycle();
     printf("present rescue: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

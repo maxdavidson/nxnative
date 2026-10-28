@@ -6,6 +6,7 @@
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include "front.h"
 #include "hle.h"
 #include "dm.h"
@@ -57,6 +58,7 @@ static CGRect fit_16_9(CGRect b) {   // the largest centered 16:9 rectangle in b
     return CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
 }
 static void tv_attach(void);
+static void tv_watch_scenes(void);
 
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
@@ -107,7 +109,7 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.fps) [self.view addSubview:self.fps];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
-    tv_attach();   // a TV connected while the launcher showed
+    tv_watch_scenes(); tv_attach();   // a TV connected while the launcher showed
     front_ios_boot();
 }
 - (void)viewDidLayoutSubviews {
@@ -146,6 +148,8 @@ UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 - (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; for (UIView *v in self.view.subviews) v.frame = fit_16_9(self.view.bounds); }
 @end
 static UIWindow *g_tv; static int g_tv_mode_was = -1;
+static _Atomic int g_tv_hz;   // the TV's refresh rate while the game is on it, else 0: the phone's screens run at multiples of 60 Hz, a TV's or monitor's may not (nvn_mtl.m link_sync)
+int front_screen_max_fps(void) { return atomic_load(&g_tv_hz); }
 static void tv_attach(void) {
     DmGameView *v = g_root.game; if (!g_tv || !v || v.superview == g_tv.rootViewController.view) return;
     [g_tv.rootViewController.view addSubview:v]; [g_tv.rootViewController.view setNeedsLayout];
@@ -155,12 +159,14 @@ static void tv_attach(void) {
     v.layer.contentsScale = MIN(v.layer.contentsScale, 1920.0 / MAX(f.size.width, 1)); [v setNeedsLayout];
     if (g_tv_mode_was < 0) g_tv_mode_was = dm_opmode();
     dm_set_opmode(1);
+    atomic_store(&g_tv_hz, (int)g_tv.windowScene.screen.maximumFramesPerSecond); dm_present_layer_moved();   // the display link made for the phone is made again for the TV
     LOG("front end: TV connected (%.0fx%.0f points), the picture moves there at %.0fx%.0f, console mode", g_tv.bounds.size.width, g_tv.bounds.size.height, f.size.width * v.layer.contentsScale, f.size.height * v.layer.contentsScale);
 }
 static void tv_detach(void) {
     DmGameView *v = g_root.game; g_tv = nil;
     if (v && v.superview != g_root.view) { [g_root.view insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
     if (g_tv_mode_was >= 0) { dm_set_opmode(g_tv_mode_was); g_tv_mode_was = -1; }
+    atomic_store(&g_tv_hz, 0); dm_present_layer_moved();
     LOG("front end: TV disconnected, the picture is back on the phone");
 }
 @interface DmTVSceneDelegate : UIResponder <UIWindowSceneDelegate>
@@ -175,6 +181,42 @@ static void tv_detach(void) {
 }
 - (void)sceneDidDisconnect:(UIScene *)s { if (g_tv == self.window) tv_detach(); self.window = nil; }
 @end
+
+// Inside LiveContainer the scene accessory is not honoured (LiveContainer issue 1694: DmTVSceneDelegate is never called): the system connects an external-display scene itself, with no delegate and no window, and goes on
+// mirroring the phone until a window is put there. A scene that connects like that gets the same window and the same moves; a build installed directly never gets here, its delegate has made the window by then
+static BOOL is_external_scene(UIScene *s) {
+    if (![s isKindOfClass:UIWindowScene.class]) return NO;
+    NSString *r = s.session.role;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [r isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive] || [r isEqualToString:UIWindowSceneSessionRoleExternalDisplay];
+#pragma clang diagnostic pop
+}
+static UIWindow *g_tv_adopted; static __weak UIWindowScene *g_tv_adopted_scene;
+static void tv_adopt(UIWindowScene *ws) {
+    if (!g_root.game || g_tv || ws.windows.count || [ws.delegate isKindOfClass:DmTVSceneDelegate.class]) return;   // not started, a TV has the game, or the delegate has this scene
+    g_tv_adopted = [[UIWindow alloc] initWithWindowScene:ws];
+    g_tv_adopted.rootViewController = [DmTVVC new];
+    g_tv_adopted.hidden = NO;   // not key: the phone's window keeps the touches of the pad
+    g_tv_adopted_scene = ws;
+    LOG("front end: TV scene without a delegate: the game's window goes into it");
+    g_tv = g_tv_adopted; tv_attach();
+}
+static void tv_watch_scenes(void) {
+    static int once; if (once++) return;
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserverForName:UISceneWillConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        UIScene *s = n.object;
+        if (![s isKindOfClass:UIWindowScene.class] || [s.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) return;
+        UIScreen *sc = ((UIWindowScene *)s).screen;   // the role says which path the system took
+        LOG("front end: scene connected: role %s, screen %.0fx%.0f pixels, delegate %s", s.session.role.UTF8String, sc.nativeBounds.size.width, sc.nativeBounds.size.height, s.delegate ? NSStringFromClass([(NSObject *)s.delegate class]).UTF8String : "none");
+        if (is_external_scene(s)) tv_adopt((UIWindowScene *)s);
+    }];
+    [nc addObserverForName:UISceneDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        if (g_tv_adopted && n.object == g_tv_adopted_scene) { g_tv_adopted = nil; tv_detach(); }
+    }];
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) if (is_external_scene(s)) tv_adopt((UIWindowScene *)s);   // a display that was connected before the game started
+}
 
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch

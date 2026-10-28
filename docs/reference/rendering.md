@@ -484,6 +484,15 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** `t_present_crop`: the window's crop wins, the layer crop is used without one, one larger than the texture is ignored, and a real `nvnQueuePresentTexture` queues the layer crop (that check fails with the old call). On an iPhone 15 Pro in handheld mode Link's Awakening's picture fills the screen's height.
 - **Found on:** [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md#rendering) (1.1.0, handheld mode on the iPhone).
 
+### A monitor on an iPhone inside LiveContainer mirrors the phone
+
+- **Symptom:** a monitor on the iPhone's USB-C port mirrors the phone's screen (the 16:9 game inside the phone's shape, the controls over it, black bars on the monitor) although the app registers the TV scene ([PR #367](https://github.com/seedds/nxnative/pull/367)).
+- **Cause:** inside LiveContainer the app's own scene configuration and scene accessory are not honoured ([LiveContainer issue 1694](https://github.com/LiveContainer/LiveContainer/issues/1694): the accessory stays unavailable and the delegate is never called). The system connects an external-display scene itself, with no delegate and no window, and mirrors the phone until a window is put there. A layer moved to another screen also kept the display link made for the first one.
+- **Fix:** `front_ios.m` watches `UISceneWillConnectNotification` (and the scenes already connected when the game starts) and gives an external-display scene that has no delegate and no window the same window, view controller and moves as the TV delegate's (`tv_adopt`); a build installed directly never reaches it, its delegate has made the window. `dm_present_layer_moved` (`nvn_mtl.m`) makes `link_sync` tear down the display link of the old screen and start one for the new, and `front_screen_max_fps` reports the monitor's refresh rate while the game is on it (the phone's screens run at multiples of 60 Hz, a monitor's may not).
+- **Check:** `t_present_rescue` (a moved layer's link is torn down, a move with no link starts none); the iOS sources compile. An earlier form of this change, which took the monitor's native pixels, was run on an iPhone 17 Pro inside LiveContainer with a wired USB-C monitor: the game on the monitor and the controls on the phone. This form (on top of the 1080p cap and the TV mode that PR #367 landed as `a5bf542f`) is not run on a device.
+- **Limit:** AirPlay is not covered under LiveContainer (its issue reports a black receiver). The scene accessory is an iOS 27 API; the adoption itself does not depend on it.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game) (an iPhone 17 Pro on a 4K USB-C monitor, inside LiveContainer).
+
 ## Blend, depth and stencil
 
 ### No writes to colour outputs the shader does not write

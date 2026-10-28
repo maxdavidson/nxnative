@@ -13,8 +13,12 @@ static inline void front_hud_env(void) {
 void front_run(void (*guest)(void));
 // The CAMetalLayer the graphics backend presents frames to (NULL when there is no window)
 void *front_metal_layer(void);
-// The highest refresh rate of the window's screen in Hz, 0 = not known (Mac front_mac.m; none on iOS, whose screens run at multiples of 60 Hz). Any thread
+// The highest refresh rate of the window's screen in Hz, 0 = not known (Mac front_mac.m; on iOS only while the game is on an external display, front_ios.m: the phone's screens run at multiples of
+// 60 Hz, a monitor's may not). Any thread
 int front_screen_max_fps(void);
+// The front end moved the game's CAMetalLayer to a window on another screen (iOS: an external display connected or removed): the display link made for the old screen is made again (nvn_mtl.m link_sync).
+// Any thread
+void dm_present_layer_moved(void);
 // The frame rate the display link paces the game at (60, 30, 120; nvn_mtl.m link_sync): in fullscreen, a screen whose refresh rate is not a multiple of it is switched, while the game runs,
 // to a mode of the same size whose rate is, and back when the window leaves fullscreen or that screen (front_mac.m; none on iOS). Called from the present thread
 void front_screen_match(int fps);

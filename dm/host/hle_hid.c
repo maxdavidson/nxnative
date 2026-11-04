@@ -209,14 +209,37 @@ void hid_keys_init(void) {
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+// The control file is read from where the last poll stopped (off). The bytes consumed so far are hashed (FNV-1a, ph): a file rewritten in place, shorter, longer or the same
+// length, no longer has that prefix, so it is read from the start. Appended lines keep the prefix and are read from off
+#define CTL_FNV_BASIS 14695981039346656037ull
+static uint64_t ctl_fnv(uint64_t h, const char *p, size_t n) { for (size_t i = 0; i < n; i++) { h ^= (unsigned char)p[i]; h *= 1099511628211ull; } return h; }
+static uint64_t ctl_prefix_hash(FILE *f, long n) {
+    uint64_t h = CTL_FNV_BASIS; char buf[4096]; long left = n;
+    if (fseek(f, 0, SEEK_SET)) return 0;
+    while (left > 0) {   // a short read is the end of the file (or an error): no further read
+        size_t want = left < (long)sizeof buf ? (size_t)left : sizeof buf, got = fread(buf, 1, want, f);
+        h = ctl_fnv(h, buf, got); left -= (long)got;
+        if (got < want) break;
+    }
+    return h;
+}
 static void *ctl_main(void *arg) {
-    const char *path = arg; long off = 0; char line[1100];
+    const char *path = arg; long off = 0; uint64_t ph = CTL_FNV_BASIS; char line[1100];
     for (;;) {
         FILE *f = fopen(path, "r");
+        if (f && !fseek(f, 0, SEEK_END)) { long size = ftell(f); if (size < off || (off > 0 && ctl_prefix_hash(f, off) != ph)) { off = 0; ph = CTL_FNV_BASIS; } }
         if (f && !fseek(f, off, SEEK_SET)) {
             while (fgets(line, sizeof line, f)) {
-                size_t n = strlen(line); if (!n || line[n - 1] != '\n') break;   // a line still being written: read it next time
-                off += (long)n; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
+                size_t n = strlen(line);
+                if (n == sizeof line - 1 && line[n - 1] != '\n') {   // longer than the buffer: skipped whole, its end hashed too; the offset moves only once its newline is there
+                    uint64_t h2 = ctl_fnv(ph, line, n); long add = (long)n; int c;
+                    while ((c = fgetc(f)) != EOF && c != '\n') { char b = (char)c; h2 = ctl_fnv(h2, &b, 1); add++; }
+                    if (c == EOF) break;   // still being written: read it on the next poll
+                    LOG("[RED] DM_CTL: a line of %d bytes or more is skipped (not a command)", (int)sizeof line - 1);
+                    off += add + 1; ph = ctl_fnv(h2, "\n", 1); continue;
+                }
+                if (!n || line[n - 1] != '\n') break;   // a line still being written: read it next time
+                off += (long)n; ph = ctl_fnv(ph, line, n); line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
                 if (!n || line[0] == '#') continue;
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }

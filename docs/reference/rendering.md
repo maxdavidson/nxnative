@@ -591,6 +591,16 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md): each ink stamp's pass, scissored to 1952x2940 at (0, 3460), about 0.95 → 0.32 ms. Metal keeps what lies outside the area (a 6400x6400 target checked texel by texel on an M4 Pro, with API validation on).
 - **Note:** the same stamps sample the map they write, with a game barrier each, so each still takes a whole snapshot of it ([Same-pass feedback read through a snapshot](#same-pass-feedback-read-through-a-snapshot)), about 0.76 ms; a copy of the stamp's rectangle takes 0.09 ms, but nothing proves a stamp samples only inside it. **Open.**
 
+## HDR output
+
+### The status query and the present for an HDR window
+
+- **Symptom:** no HDR output on a Switch 2 game that asks for its HDR status: its window stays RGBA8 and the picture is SDR.
+- **Cause:** `vi::QueryDisplayHdrStatus` answered SDR, so the game never made its RGB10A2 PQ window, and the present had no decode for it.
+- **Fix:** with `DM_HDR=1` the status answers HDR on (Switch 2 SDKs only). The layer is RGBA16Float in extended linear BT.2020 on any screen. `present.metal` `fs_linear` decodes PQ to linear light (1.0 at `DM_HDR_PAPER_WHITE`, default 203) and maps BT.709 sources into BT.2020. Highlights roll off into the screen's headroom: `maximumExtendedDynamicRangeColorComponentValue` on the Mac, `UIScreen.currentEDRHeadroom` on the iPhone. With no headroom, the largest channel of a highlight goes to SDR white with its hue kept. An RGB10A2 window is decoded as PQ only after the status has answered HDR on; otherwise it is presented as stored (gamma-coded when the layer is HDR).
+- **Open:** `DM_HDR_FMT` is a guess, and the roll-off is untested on an EDR display. The window's primaries are settled in the Donkey Kong Bananza note.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#hdr-output).
+
 ## Blend, depth and stencil
 
 ### Ten attachment records for eight colors and depth-stencil

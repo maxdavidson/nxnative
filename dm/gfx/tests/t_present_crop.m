@@ -130,6 +130,16 @@ static void hdr_checks(void) {
     uint32_t red=rgb10a2(594,0,0);id<MTLTexture> rw=hdr_src(MTLPixelFormatRGB10A2Unorm,4,4,&red,4);
     hdr_present(rw,MTLPixelFormatBGRA8Unorm,4,v);EXPECT("BT.2020 red outside BT.709 on the SDR route: clipped to red",1,v[0]>=254&&v[1]<=1&&v[2]<=1);
     hdr_present(rw,MTLPixelFormatRGBA16Float,4,v);EXPECTF("  on the linear route: BT.709 red 1.66, above SDR white",1.6598,v[0],0.006);EXPECT("  green and blue clipped at 0",1,v[1]==0&&v[2]==0);
+    {   // A PQ window shown smaller is filtered in light: columns of PQ 769 (998.9 nits) and 0 at 2:1 weigh 0.5 each (the tent's 0.25 + 0.75 on each), so 499.5 nits, 2.4604 at 203
+        // nits a unit, where filtering the codes gave PQ 384.5, 24.8 nits (0.1222). On the SDR route: white (clipped), not sRGB code 98
+        uint32_t px[64];for(int i=0;i<64;i++)px[i]=(i%8)%2?rgb10a2(0,0,0):rgb10a2(769,769,769);
+        MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGB10A2Unorm width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;
+        id<MTLTexture> sw=[g_dev newTextureWithDescriptor:d];[sw replaceRegion:MTLRegionMake2D(0,0,8,8) mipmapLevel:0 withBytes:px bytesPerRow:32];res_add(sw);res_commit();
+        hdr_present(sw,MTLPixelFormatRGBA16Float,4,v);EXPECTF("PQ 998.9-nit and black columns at 2:1 on the linear route: filtered in light, 2.4604",2.4604,v[0],0.012);EXPECTF("  blue",2.4604,v[2],0.012);
+        hdr_present(sw,MTLPixelFormatBGRA8Unorm,4,v);EXPECT("  on the SDR route: white (half of 998.9 nits is above the paper white), not code 98",1,v[0]>=254&&v[2]>=254);
+        hdr_present(sw,MTLPixelFormatRGBA16Float,16,v);EXPECTF("  at 1:2 (larger) the centre pixel, 3/4 of the way to a bright column from a black one: 3/4 of its light, 3.6907 (the codes gave 0.8501)",3.6907,v[0],0.02);
+        res_remove(sw);
+    }
     // The inverse tone map of an 8-bit window: exact greys and white from a 16-bit source (the same route), then an 8-bit window. Output in SDR-white units (EDR, 1.0 = 203 nits)
     uint16_t grey16[4]={30235,30235,30235,65535},white16[4]={65535,65535,65535,65535};   // sRGB 0.461356: linear 0.18
     id<MTLTexture> gw=hdr_src(MTLPixelFormatRGBA16Unorm,4,4,grey16,8),ww=hdr_src(MTLPixelFormatRGBA16Unorm,4,4,white16,8);

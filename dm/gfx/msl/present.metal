@@ -2,7 +2,7 @@
 // the drawable's:
 //   fs           an 8-bit window into an 8-bit drawable: the stored colour bytes, alpha 1 (the SDR present)
 //   fs_hdr_itm   an 8-bit window into the RGBA16Float EDR drawable: sRGB decode, then BT.2446 Method A, a target luminance never below SDR's, applied in ICtCp (1.0 = the screen's SDR white)
-//   fs_pq_linear a PQ (BT.2100) window into the EDR drawable: PQ decode, divided by the paper white vi reports, so that white is EDR 1.0, BT.2020 to BT.709, clipped at 0
+//   fs_pq_linear a PQ (BT.2100) window into the EDR drawable: PQ decode (each texel before it is filtered, src_sample_pq), divided by the paper white vi reports, so that white is EDR 1.0, BT.2020 to BT.709, clipped at 0
 //   fs_pq_to_sdr a PQ window into an 8-bit drawable or capture: PQ decode, / paper white, BT.2020 to BT.709, clipped to 1, sRGB encode
 // The inverse tone map and the PQ curves are ported from mtld3d (unix/unix/src/metal/present.msl); P_SDR follows BT.2446's formula for 100 nits (mtld3d's 5.4395 is 87 nits)
 #include <metal_stdlib>
@@ -54,7 +54,7 @@ static float4 sample_row(texture2d<float> t, sampler s, float3 px, float3 wx, fl
 // stair-step and crawl as they move (minification aliasing), and past 2:1 texels are skipped entirely. Fetches stay within
 // the crop (edge: its first and last texel centres in uv). Output alpha is forced to 1.0: Switch scan-out ignores swapchain
 // alpha, and a non-opaque CAMetalLayer (DM_MAC_COMPOSITED / mirrored fullscreen) composites against the window backing.
-// Every route samples through it, so the HDR routes filter the window's stored values (sRGB or PQ codes) as fs does
+// fs and the inverse tone map sample through it, filtering the window's stored sRGB codes as the SDR present always has; the PQ routes take src_sample_pq below
 static float4 src_sample(V in, texture2d<float> t, sampler s, constant Crop& c) {
     float2 uv = in.uv * c.rect.zw + c.rect.xy;
     float2 size = float2(t.get_width(), t.get_height());
@@ -95,6 +95,47 @@ static float3 pq_eotf(float3 pq) {
     float3 e = pow(max(pq, 0.0f), float3(1.0f / PQ_M2));
     return 10000.0f * pow(max(e - PQ_C1, 0.0f) / max(PQ_C2 - PQ_C3 * e, 1e-20f), float3(1.0f / PQ_M1));
 }
+// A PQ window's pixel in nits: the same footprint and weights as src_sample, but each texel decoded before it is weighed. Filtering the stored codes (the sampler's bilinear,
+// src_sample) averages a curve this steep: a 999-nit texel beside a black one came out at 25 nits instead of 500, so thin highlights and bright edges lost most of their light
+// wherever the picture is shown smaller or larger than its size. Each texel of the footprint is read and decoded once (src_sample's pairs share texels between fetches): along an
+// axis shown at its size or larger the two texels of the bilinear (one at a texel centre, so a picture at its size reads one texel a pixel), along a minified one the tent's up
+// to 6. Texels outside the crop take the crop's edge texel (lo, hi: its first and last texel centres, texel units)
+struct PqAxis { int i0, n; float w[6]; };
+static PqAxis pq_axis(float step, float p, float lo, float hi) {
+    PqAxis a;
+    for (int k = 0; k < 6; k++) a.w[k] = 0.0;
+    if (step < 1.001) {
+        float f = clamp(p, lo, hi) - 0.5, i = floor(f + 1e-3), w = max(f - i, 0.0);   // within 1/1000 of a texel centre: that texel alone (a picture at its size, whose
+        a.i0 = int(i); a.w[0] = 1.0 - w; a.w[1] = w > 1e-3 ? w : 0.0; a.n = a.w[1] > 0.0 ? 2 : 1;   // interpolated coordinates land a hair off the centres)
+        if (a.n == 1) a.w[0] = 1.0;
+        return a;
+    }
+    float sc = min(step, MINIFY_SCALE_MAX), sum = 0.0;
+    a.i0 = int(floor(p - 0.5 - sc)) + 1; a.n = min(int(ceil(p - 0.5 + sc)) - a.i0, 6);
+    for (int k = 0; k < 6; k++) { a.w[k] = k < a.n ? tent((float(a.i0 + k) + 0.5 - p) / sc) : 0.0; sum += a.w[k]; }
+    if (sum <= 1e-6) { a.i0 = int(floor(clamp(p, lo, hi))); a.n = 1; a.w[0] = 1.0; for (int k = 1; k < 6; k++) a.w[k] = 0.0; return a; }
+    for (int k = 0; k < 6; k++) a.w[k] /= sum;
+    return a;
+}
+static float3 src_sample_pq(V in, texture2d<float> t, constant Crop& c) {
+    float2 uv = in.uv * c.rect.zw + c.rect.xy;
+    float2 size = float2(t.get_width(), t.get_height());
+    float2 step = abs(float2(dfdx(uv.x), dfdy(uv.y))) * size, p = uv * size;
+    float2 lo = min(c.edge.xy, c.edge.zw) * size, hi = max(c.edge.xy, c.edge.zw) * size;
+    int2 first = int2(floor(lo)), last = int2(floor(hi));   // the crop's first and last texels
+    PqAxis ax = pq_axis(step.x, p.x, lo.x, hi.x), ay = pq_axis(step.y, p.y, lo.y, hi.y);
+    float3 sum = 0.0;   // fixed trip counts, so both loops unroll and the weights stay in registers; a weight past n is 0 and skips its texel
+    #pragma clang loop unroll(full)
+    for (int y = 0; y < 6; y++) {
+        if (ay.w[y] > 0.0) {
+            float3 row = 0.0;
+            #pragma clang loop unroll(full)
+            for (int x = 0; x < 6; x++) if (ax.w[x] > 0.0) row += ax.w[x] * pq_eotf(t.read(uint2(clamp(int2(ax.i0 + x, ay.i0 + y), first, last))).rgb);
+            sum += ay.w[y] * row;
+        }
+    }
+    return sum;
+}
 // BT.2446 Method A: the luminance of an SDR pixel (1.0 = L_SDR) to HDR nits for the peak u.x = L_HDR (u: L_HDR, p_hdr, log2 p_hdr, 1 / (p_hdr - 1))
 static float bt2446_a(float y_sdr, float4 u) {
     float yp_c = log(pow(y_sdr, 1.0f / 2.4f) * (P_SDR - 1.0f) + 1.0f) / LOG_P_SDR;
@@ -123,8 +164,8 @@ fragment float4 fs_hdr_itm(V in [[stage_in]], texture2d<float> t [[texture(0)]],
 // The PQ window in linear BT.709 values, which the layer (the screen's own colour space, as for fs_hdr_itm) shows in the panel's primaries: the same look as the SDR present and
 // the inverse tone map, which show 8-bit values that way. A colour outside BT.709 is clipped at 0
 fragment float4 fs_pq_linear(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {
-    return float4(max(M_BT2020_TO_BT709 * (pq_eotf(src_sample(in, t, s, c).rgb) / c.pq.x), 0.0f), 1);
+    return float4(max(M_BT2020_TO_BT709 * (src_sample_pq(in, t, c) / c.pq.x), 0.0f), 1);
 }
 fragment float4 fs_pq_to_sdr(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {
-    return float4(srgb_oetf(saturate(M_BT2020_TO_BT709 * (pq_eotf(src_sample(in, t, s, c).rgb) / c.pq.x))), 1);
+    return float4(srgb_oetf(saturate(M_BT2020_TO_BT709 * (src_sample_pq(in, t, c) / c.pq.x))), 1);
 }
